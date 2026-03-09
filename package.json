@@ -1,8 +1,8 @@
 {
-  "name": "copy-to-llm",
-  "displayName": "Copy to LLM",
-  "description": "Copy directory or file contents to LLM format",
-  "version": "0.1.1",
+  "name": "copy-to-llm-rtk",
+  "displayName": "Copy to LLM with RTK",
+  "description": "Copy directory or file contents to LLM format with optional RTK compression for 60-90% token savings",
+  "version": "0.1.0",
   "engines": {
     "vscode": "^1.60.0"
   },
@@ -10,15 +10,16 @@
     "Other"
   ],
   "icon": "icon.png",
-  "publisher": "Compile-TomaszKasperczyk",
+  "publisher": "luutuankiet",
   "repository": {
     "type": "git",
-    "url": "https://github.com/TKasperczyk/vscode-copy-to-llm"
+    "url": "https://github.com/luutuankiet/vscode-copy-to-llm"
   },
   "activationEvents": [
     "onCommand:extension.copyToLLM",
     "onCommand:extension.copySelectionToLLM",
-    "onCommand:extension.copyDiffToLLM"
+    "onCommand:extension.copyDiffToLLM",
+    "onCommand:extension.copyCompressedToLLM"
   ],
   "main": "./out/extension.js",
   "contributes": {
@@ -34,12 +35,21 @@
       {
         "command": "extension.copyDiffToLLM",
         "title": "Copy Git Diff to LLM"
+      },
+      {
+        "command": "extension.copyCompressedToLLM",
+        "title": "Copy Compressed to LLM"
       }
     ],
     "menus": {
       "explorer/context": [
         {
           "command": "extension.copyToLLM",
+          "group": "z_commands",
+          "when": "explorerResourceIsFolder || resourceScheme == 'file'"
+        },
+        {
+          "command": "extension.copyCompressedToLLM",
           "group": "z_commands",
           "when": "explorerResourceIsFolder || resourceScheme == 'file'"
         }
@@ -178,7 +188,8 @@
     "package": "vsce package"
   },
   "dependencies": {
-    "minimatch": "^10.0.3"
+    "minimatch": "^9.0.0",
+    "p-limit": "^4.0.0"
   },
   "devDependencies": {
     "@types/node": "^14.14.37",

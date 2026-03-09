@@ -5,8 +5,74 @@ import * as vscode from "vscode";
 import { Minimatch } from "minimatch";
 import { execFile } from "child_process";
 import { promisify } from "util";
+import pLimit from "p-limit";
 
 const execFileAsync = promisify(execFile);
+
+// RTK concurrency limit (8 parallel processes)
+const rtkLimit = pLimit(8);
+
+// RTK availability flag (checked once per session)
+let rtkAvailable: boolean | null = null;
+
+/**
+ * Check if RTK binary is installed
+ */
+async function isRtkInstalled(): Promise<boolean> {
+  if (rtkAvailable !== null) {
+    return rtkAvailable;
+  }
+  try {
+    await execFileAsync("rtk", ["--version"]);
+    rtkAvailable = true;
+    return true;
+  } catch {
+    rtkAvailable = false;
+    return false;
+  }
+}
+
+/**
+ * Read a file through RTK for compressed output
+ */
+async function rtkReadFile(filePath: string): Promise<string> {
+  try {
+    const { stdout } = await execFileAsync("rtk", ["read", filePath], {
+      maxBuffer: 10 * 1024 * 1024, // 10MB buffer
+      timeout: 30000, // 30 second timeout
+    });
+    return stdout;
+  } catch (err: any) {
+    console.warn(`RTK failed for ${filePath}: ${err.message}`);
+    // Fallback to raw read
+    return fs.promises.readFile(filePath, "utf-8");
+  }
+}
+
+/**
+ * Generate compressed content using RTK with parallel execution
+ */
+async function generateCompressedContent(files: string[]): Promise<string> {
+  const wsFolder = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? "";
+
+  const results = await Promise.all(
+    files.map((file) =>
+      rtkLimit(async () => {
+        try {
+          const compressed = await rtkReadFile(file);
+          const relativePath = path.relative(wsFolder, file).replace(/\\/g, "/");
+          return `<file src="${relativePath}">\n${compressed}</file>`;
+        } catch (err: any) {
+          console.warn(`Failed to process ${file}: ${err.message}`);
+          return null;
+        }
+      })
+    )
+  );
+
+  const validResults = results.filter(Boolean).join("\n\n");
+  return `<context compressed="true">\n${validResults}\n</context>`;
+}
 
 /**
  * Safely execute a git command with proper argument handling (no shell injection)
@@ -257,6 +323,54 @@ export function activate(context: vscode.ExtensionContext) {
     }
   );
   context.subscriptions.push(copyDiff);
+
+  // RTK Compressed Copy command
+  const copyCompressed = vscode.commands.registerCommand(
+    "extension.copyCompressedToLLM",
+    async (uri?: vscode.Uri, selectedUris?: vscode.Uri[]) => {
+      // Check RTK availability first
+      if (!(await isRtkInstalled())) {
+        vscode.window.showWarningMessage(
+          "RTK not found. Install with: brew install rtk-ai/tap/rtk. Using full content instead."
+        );
+        // Fallback to regular copy
+        await vscode.commands.executeCommand("extension.copyToLLM", uri, selectedUris);
+        return;
+      }
+
+      // If no parameters provided (hotkey usage), get explorer selection
+      if (!uri && (!selectedUris || selectedUris.length === 0)) {
+        selectedUris = await getExplorerSelection();
+        if (!selectedUris || selectedUris.length === 0) {
+          const active = vscode.window.activeTextEditor;
+          if (active) {
+            await copyCompressedFileToClipboard(active.document.fileName);
+            return;
+          }
+          vscode.window.showWarningMessage(
+            "Please select files in the Explorer first"
+          );
+          return;
+        }
+      }
+
+      if (selectedUris && selectedUris.length > 0) {
+        await copyCompressedSelectedToLLM(selectedUris);
+      } else if (uri && uri.scheme === "file") {
+        try {
+          const stats = fs.statSync(uri.fsPath);
+          if (stats.isDirectory()) {
+            await copyCompressedFolderToLLM([uri]);
+          } else if (stats.isFile()) {
+            await copyCompressedFileToClipboard(uri.fsPath);
+          }
+        } catch (err: any) {
+          vscode.window.showErrorMessage(`Cannot access path: ${err.message}`);
+        }
+      }
+    }
+  );
+  context.subscriptions.push(copyCompressed);
 }
 
 // Helper function to get submodule information for a given file path
@@ -549,6 +663,77 @@ async function showPreview(content: string) {
     language: "markdown",
   });
   await vscode.window.showTextDocument(document);
+}
+
+/**
+ * Copy compressed content for selected files/folders
+ */
+async function copyCompressedSelectedToLLM(uris: vscode.Uri[]) {
+  const allFiles: string[] = [];
+
+  for (const uri of uris) {
+    try {
+      const stats = fs.statSync(uri.fsPath);
+      if (stats.isDirectory()) {
+        const dirFiles = await getFilesByExtensions(uri.fsPath);
+        allFiles.push(...dirFiles);
+      } else if (stats.isFile()) {
+        allFiles.push(uri.fsPath);
+      }
+    } catch {
+      // Skip inaccessible paths
+    }
+  }
+
+  if (allFiles.length === 0) {
+    vscode.window.showWarningMessage("No files to copy");
+    return;
+  }
+
+  const content = await generateCompressedContent(allFiles);
+  await vscode.env.clipboard.writeText(content);
+  vscode.window.showInformationMessage(
+    `Compressed ${allFiles.length} file(s) to clipboard`
+  );
+  await showPreview(content);
+}
+
+/**
+ * Copy compressed content for folders
+ */
+async function copyCompressedFolderToLLM(uris: vscode.Uri[]) {
+  const allFiles: string[] = [];
+
+  for (const uri of uris) {
+    const files = await getFilesByExtensions(uri.fsPath);
+    allFiles.push(...files);
+  }
+
+  if (allFiles.length === 0) {
+    vscode.window.showWarningMessage("No files to copy");
+    return;
+  }
+
+  const content = await generateCompressedContent(allFiles);
+  await vscode.env.clipboard.writeText(content);
+  vscode.window.showInformationMessage(
+    `Compressed ${allFiles.length} file(s) to clipboard`
+  );
+  await showPreview(content);
+}
+
+/**
+ * Copy compressed content for a single file
+ */
+async function copyCompressedFileToClipboard(filePath: string) {
+  try {
+    const content = await generateCompressedContent([filePath]);
+    await vscode.env.clipboard.writeText(content);
+    vscode.window.showInformationMessage("Compressed content copied to clipboard");
+    await showPreview(content);
+  } catch (err: any) {
+    vscode.window.showErrorMessage(`Cannot read file: ${err.message}`);
+  }
 }
 
 export function deactivate() { }
